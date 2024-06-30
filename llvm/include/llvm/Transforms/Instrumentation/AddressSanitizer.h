@@ -28,6 +28,12 @@ struct AddressSanitizerOptions {
       AsanDetectStackUseAfterReturnMode::Runtime;
 };
 
+
+//
+enum addrType {IBIO, VBIO, IBVO, VBVO, UNKNOWN};
+enum SCEVType {SEIncrease, SEDecrease, SEConstant, SELoopInvariant, SEUnknown};
+
+
 /// Public interface to the address sanitizer module pass for instrumenting code
 /// to check for various memory errors.
 ///

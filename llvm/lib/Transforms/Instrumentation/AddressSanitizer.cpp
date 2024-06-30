@@ -77,6 +77,11 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/Analysis/PostDominators.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/Analysis/CFG.h"
+#include "llvm/IR/CFG.h"
+#include <list>
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
@@ -90,6 +95,10 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "asan"
+#define RZ_SIZE 16
+#define CHECK_RANGE 64
+#define CHECK_RANGE_LOOP 32
+#define MAX_STEP_SIZE 8
 
 static const uint64_t kDefaultShadowScale = 3;
 static const uint64_t kDefaultShadowOffset32 = 1ULL << 29;
@@ -185,6 +194,19 @@ constexpr size_t kAccessSizeIndexShift = 1;
 constexpr size_t kAccessSizeIndexMask = 0xf;
 constexpr size_t kIsWriteShift = 5;
 constexpr size_t kIsWriteMask = 0x1;
+
+// ASan Opt Util
+// Add these declarations after the existing include statements
+static void singleIndexCaseHandler(std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, GetElementPtrInst *Gep_Inst, Instruction *Inst);
+static void multiIndexCaseHandler(std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, GetElementPtrInst *Gep_Inst, Instruction *Inst);
+static void preprocessPotentialRemoveInsts(Function &F, std::pair<const std::pair<llvm::Value *, std::__cxx11::string>, std::set<std::pair<int64_t, llvm::Instruction *>>> &baseAddrOffsetSet, std::map<Instruction *, std::set<std::pair<Instruction *, Instruction *>>> &potentialRemoveInsts);
+static void removeInstructionFunc(std::map<Instruction *, std::set<std::pair<Instruction *, Instruction *>>> &potentialRemoveInsts, std::set<Instruction *> &deleted);
+static void preprocessInstructionsMap(Function &F, std::pair<const std::pair<llvm::Value *, std::__cxx11::string>, std::set<std::pair<int64_t, llvm::Instruction *>>> &baseAddrOffsetSet, std::map<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>> &instructionsMap);
+static void prioritiseRemovableInst(std::map<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>> &instructionsMap, std::list<std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>>> &rankPotentialRemoveInsts);
+static std::pair<int64_t, llvm::Instruction *> getLastInst(Function &F, std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>> optInst);
+static std::pair<int64_t, llvm::Instruction *> getMinDistance(std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>> optInst);
+static int getMaxDistance(std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>> optInst);
+static void updateBaseAddrOffsetMap(std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, std::set<Instruction *> &deleted);
 
 // Command-line flags.
 
@@ -705,6 +727,23 @@ struct AddressSanitizer {
   void markEscapedLocalAllocas(Function &F);
 
 private:
+
+  void ASAN_Optimizations(Function &F, SmallVector<Instruction *, 16> &ToInstrument);
+  void sequentialExecuteOptimization(Function &F, SmallVector<Instruction *, 16> &ToInstrument);
+  void sequentialExecuteOptimizationPostDom(Function &F, SmallVector<Instruction *, 16> &ToInstrument);
+  void ConservativeCallIntrinsicCollect(Function &F, std::set<Instruction *> &callIntrinsicSet);
+  bool ConservativeCallIntrinsicCheck(Instruction *InstStart, Instruction *InstEnd, std::set<Instruction *> &callIntrinsicSet, llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT);
+  void sequentialExecuteOptimizationBoost(Function &F, SmallVector<Instruction *, 16> &ToInstrument);
+  void baseAddrOffsetMapPreprocessing(SmallVector<Instruction *, 16> &ToInstrument, std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi);
+  void mrgNeighborChks(Function &F, std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, std::set<Instruction *> &deleted);
+  void optimizeInstrumentation(Function &F, std::list<std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>>> &rankPotentialRemoveInsts, std::set<Instruction *> &deleted);
+  void loopOptimization(Function &F, SmallVector<Instruction *, 16> &ToInstrument);
+  enum addrType loopOptimizationCategorise(Function &F, Loop *L, Instruction *Inst, SmallVector<Instruction *, 16> &ToInstrument);
+
+  // Add these declarations in the private section of the AddressSanitizer class
+  bool btraceInLoop(Value *v, std::vector<Value *> &backs, Loop *L);
+  enum addrType checkAddrType(Value *addr, std::vector<Value *> backs, std::vector<Value *> &processedAddr, ScalarEvolution *SE, Loop *L);
+
   friend struct FunctionStackPoisoner;
 
   void initializeCallbacks(Module &M);
@@ -3442,4 +3481,616 @@ bool AddressSanitizer::isSafeAccess(ObjectSizeOffsetVisitor &ObjSizeVis,
   // . Size - Offset >= NeededSize  (unsigned)
   return Offset >= 0 && Size >= uint64_t(Offset) &&
          Size - uint64_t(Offset) >= TypeSize / 8;
+}
+
+void AddressSanitizer::ASAN_Optimizations(Function &F, SmallVector<Instruction *, 16> &ToInstrument) {
+  // "Removing Recurring Checks" Optimization
+  sequentialExecuteOptimizationPostDom(F, ToInstrument);
+
+  sequentialExecuteOptimization(F, ToInstrument);
+
+  // "Optimizing Neighbor Checks" Optimization
+  sequentialExecuteOptimizationBoost(F, ToInstrument);
+
+  // "Optimizing Neighbor Checks" Optimization
+  loopOptimization(F, ToInstrument);
+}
+
+void AddressSanitizer::sequentialExecuteOptimizationPostDom(Function &F, SmallVector<Instruction *, 16> &ToInstrument) {
+  bool IsWrite;
+  unsigned Alignment;
+  uint64_t TypeSize;
+  Value *MaybeMask = nullptr;
+
+  auto PDT = PostDominatorTree();
+  PDT.recalculate(F);
+
+  AliasAnalysis *AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+  std::map<Value *, std::set<Instruction *>> AddrToInstructions;
+
+  // Pre-processing
+  // Group instructions that access the same address (alias considered)
+  for (auto Inst : ToInstrument) {
+    if (Value *Addr = isInterestingMemoryAccess(Inst, &IsWrite, &TypeSize, &Alignment, &MaybeMask)) {
+      if (AddrToInstructions.find(Addr) == AddrToInstructions.end()) {
+        bool aliasFound = false;
+        // Handle the possibility of alias
+        for (auto item : AddrToInstructions) {
+          if (AA->isMustAlias(item.first, Addr)) {
+            aliasFound = true;
+            AddrToInstructions[item.first].insert(Inst);
+            break;
+          }
+        }
+        if (aliasFound) continue;
+
+        // Never appeared in the map, so add a slot
+        AddrToInstructions.insert(std::pair<Value *, std::set<Instruction *>>(Addr, std::set<Instruction *>()));
+      }
+      // Add the inst to the target slot (either the newly created one or an existing one)
+      AddrToInstructions[Addr].insert(Inst);
+    }
+  }
+
+  std::set<Instruction *> deleted;
+
+  for (auto item : AddrToInstructions) {
+    for (auto inst1 : item.second) {
+      if (deleted.find(inst1) != deleted.end())
+        continue;
+
+      for (auto inst2 : item.second) {
+        if (inst1 == inst2 || deleted.find(inst2) != deleted.end())
+          continue;
+
+        if (PDT.dominates(inst1->getParent(), inst2->getParent())) {
+          deleted.insert(inst2);
+        }
+      }
+    }
+  }
+
+  // Let's only keep the non-deleted ones
+  SmallVector<Instruction *, 16> SEOTempToInstrument(ToInstrument);
+  ToInstrument.clear();
+
+  for (auto item: SEOTempToInstrument) {
+    if (deleted.find(item) == deleted.end())
+      ToInstrument.push_back(item);
+  }
+}
+
+void AddressSanitizer::sequentialExecuteOptimization(Function &F, SmallVector<Instruction *, 16> &ToInstrument) {
+  bool IsWrite;
+  unsigned Alignment;
+  uint64_t TypeSize;
+  Value *MaybeMask = nullptr;
+
+  auto DT = DominatorTree(F);
+  auto PDT = PostDominatorTree();
+  PDT.recalculate(F);
+  AliasAnalysis *AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+  std::map<Value *, std::set<Instruction *>> AddrToInstructions;
+
+  // Pre-processing
+  // Group instructions that access the same address (alias considered)
+  for (auto Inst : ToInstrument) {
+    if (Value *Addr = isInterestingMemoryAccess(Inst, &IsWrite, &TypeSize, &Alignment, &MaybeMask)) {
+      if (AddrToInstructions.find(Addr) == AddrToInstructions.end()) {
+        bool aliasFound = false;
+        // Handle the possibility of alias
+        for (auto item : AddrToInstructions) {
+          if (AA->isMustAlias(item.first, Addr)) {
+            aliasFound = true;
+            AddrToInstructions[item.first].insert(Inst);
+            break;
+          }
+        }
+        if (aliasFound) continue;
+
+        // Never appeared in the map, so add a slot
+        AddrToInstructions.insert(std::pair<Value *, std::set<Instruction *>>(Addr, std::set<Instruction *>()));
+      }
+      // Add the inst to the target slot (either the newly created one or an existing one)
+      AddrToInstructions[Addr].insert(Inst);
+    }
+  }
+
+  std::set<Instruction *> deleted;
+
+  for (auto item : AddrToInstructions) {
+    for (auto inst1 : item.second) {
+      if (deleted.find(inst1) != deleted.end())
+        continue;
+
+      for (auto inst2 : item.second) {
+        if (inst1 == inst2 || deleted.find(inst2) != deleted.end())
+          continue;
+
+        if (DT.dominates(inst1, inst2)) {
+          deleted.insert(inst2);
+        }
+      }
+    }
+  }
+
+  // Let's only keep the non-deleted ones
+  SmallVector<Instruction *, 16> SEOTempToInstrument(ToInstrument);
+  ToInstrument.clear();
+
+  for (auto item: SEOTempToInstrument) {
+    if (deleted.find(item) == deleted.end())
+      ToInstrument.push_back(item);
+  }
+}
+
+void AddressSanitizer::ConservativeCallIntrinsicCollect(Function &F, std::set<Instruction *> &callIntrinsicSet) {
+  for (auto &BB : F) {
+    for (auto &Inst : BB) {
+      // Here we check if current instruction is call instruction
+      if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
+        callIntrinsicSet.insert(&Inst);
+        continue;
+      }
+      IntrinsicInst *II = dyn_cast<IntrinsicInst>(&Inst);
+      // Here we check if Intrinsic ID is lifetime_end
+      if (II && II->getIntrinsicID() == Intrinsic::lifetime_end) {
+        callIntrinsicSet.insert(&Inst);
+        continue;
+      }
+    }
+  }
+}
+
+bool AddressSanitizer::ConservativeCallIntrinsicCheck(Instruction *InstStart, Instruction *InstEnd, std::set<Instruction *> &callIntrinsicSet, llvm::DominatorTree &DT, llvm::PostDominatorTree &PDT) {
+  for (auto TargetInst : callIntrinsicSet) {
+    // InstStart -> TargetInst -> InstEnd && InstStart !PostDominat TargetInst
+    if (isPotentiallyReachable(InstStart, TargetInst, &DT) && isPotentiallyReachable(TargetInst, InstEnd, &DT) && !PDT.dominates(InstStart->getParent(), TargetInst->getParent())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void AddressSanitizer::sequentialExecuteOptimizationBoost(Function &F, SmallVector<Instruction *, 16> &ToInstrument) {
+  std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> baseAddrOffsetMap_multi;
+
+  baseAddrOffsetMapPreprocessing(ToInstrument, baseAddrOffsetMap_multi);
+
+  std::set<Instruction *> deleted;
+
+  // "Removing Neighbor Checks" Optimization
+  rmNeighborChks(F, baseAddrOffsetMap_multi, deleted);
+
+  updateBaseAddrOffsetMap(baseAddrOffsetMap_multi, deleted);
+
+  // "Merging Neighbor Checks" Optimization
+  mrgNeighborChks(F, baseAddrOffsetMap_multi, deleted);
+
+  // Let's only keep the non-deleted ones
+  SmallVector<Instruction *, 16> SEOTempToInstrument(ToInstrument);
+  ToInstrument.clear();
+
+  for (auto item: SEOTempToInstrument) {
+    if (deleted.find(item) == deleted.end())
+      ToInstrument.push_back(item);
+  }
+}
+
+void AddressSanitizer::baseAddrOffsetMapPreprocessing(SmallVector<Instruction *, 16> &ToInstrument, std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi) {
+  bool IsWrite;
+  unsigned Alignment;
+  uint64_t TypeSize;
+
+  for (auto Inst : ToInstrument) {
+    Value *addr = isInterestingMemoryAccess(Inst, &IsWrite, &TypeSize, &Alignment);
+    if (!addr)
+      continue;
+
+    while (CastInst *Cast_Inst = dyn_cast<CastInst>(addr))
+      addr = Cast_Inst->getOperand(0);
+
+    // Check if current address is from a gep instruction
+    if (GetElementPtrInst *Gep_Inst = dyn_cast<GetElementPtrInst>(addr)) {
+      if (Gep_Inst->getNumIndices() == 1) {
+        singleIndexCaseHandler(baseAddrOffsetMap_multi, Gep_Inst, Inst);
+        continue;
+      }
+      multiIndexCaseHandler(baseAddrOffsetMap_multi, Gep_Inst, Inst);
+      continue;
+    }
+  }
+}
+
+void AddressSanitizer::rmNeighborChks(Function &F, std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, std::set<Instruction *> &deleted) {
+  for (auto baseAddrOffsetSet : baseAddrOffsetMap_multi) {
+    // Create a map to store the ASan check removable instruction, and the pair of instruction to ensure the ASan check
+    std::map<Instruction *, std::set<std::pair<Instruction *, Instruction *>>> potentialRemoveInsts;
+    // Cases for size of set >= 3
+    if ((baseAddrOffsetSet.second).size() >=3 ) {
+      preprocessPotentialRemoveInsts(F, baseAddrOffsetSet, potentialRemoveInsts);
+      removeInstructionFunc(potentialRemoveInsts, deleted);
+    }
+  }
+}
+
+void AddressSanitizer::mrgNeighborChks(Function &F, std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, std::set<Instruction *> &deleted) {
+  auto DT = DominatorTree(F);
+  auto PDT = PostDominatorTree();
+  PDT.recalculate(F);
+
+  for (auto baseAddrOffsetSet : baseAddrOffsetMap_multi) {
+    // Create a map to store the instruction, and a vector of instructions it can remove
+    std::map<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>> instructionsMap;
+    std::list<std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>>> rankPotentialRemoveInsts;
+    // Cases for size of set >= 2
+    if ((baseAddrOffsetSet.second).size() >= 2) {
+      preprocessInstructionsMap(F, baseAddrOffsetSet, instructionsMap);
+      prioritiseRemovableInst(instructionsMap, rankPotentialRemoveInsts);
+      optimizeInstrumentation(F, rankPotentialRemoveInsts, deleted);
+    }
+  }
+}
+
+void AddressSanitizer::optimizeInstrumentation(Function &F, std::list<std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>>> &rankPotentialRemoveInsts, std::set<Instruction *> &deleted) {
+  bool IsWrite;
+  unsigned Alignment;
+  uint64_t TypeSize;
+
+  for (auto optInst = rankPotentialRemoveInsts.begin(); optInst != rankPotentialRemoveInsts.end(); ++optInst) {
+    std::pair<int64_t, llvm::Instruction *> lastInst = getLastInst(F, (*optInst));
+    std::pair<int64_t, llvm::Instruction *> minInst = getMinDistance(*optInst);
+    int maxDistance = getMaxDistance(*optInst) - minInst.first;
+
+    Value *addr = isInterestingMemoryAccess(minInst.second, &IsWrite, &TypeSize, &Alignment);
+    // Map current address to shadow memory, and check 64 bits range
+    IRBuilder<> IRB(lastInst.second);
+    Value *AddrLong = IRB.CreatePointerCast(addr, IntptrTy);
+    Type *ShadowTy = IntegerType::get(*C, 8U);
+    if (8 <= maxDistance && maxDistance < 16) {
+      ShadowTy = IntegerType::get(*C, 16U);
+    }
+    else if (16 <= maxDistance && maxDistance < 32) {
+      ShadowTy = IntegerType::get(*C, 32U);
+    }
+    else if (32 <= maxDistance && maxDistance < 64) {
+      ShadowTy = IntegerType::get(*C, 64U);
+    }
+    Type *ShadowPtrTy = PointerType::get(ShadowTy, 0);
+    Value *ShadowPtr = memToShadow(AddrLong, IRB);
+    Value *CmpVal = Constant::getNullValue(ShadowTy);
+    Value *ShadowValue = IRB.CreateLoad(ShadowTy, IRB.CreateIntToPtr(ShadowPtr, ShadowPtrTy));
+    Value *Cmp = IRB.CreateICmpNE(ShadowValue, CmpVal);
+
+    Instruction *CheckTerm = SplitBlockAndInsertIfThen(Cmp, lastInst.second, false);
+
+    IRBuilder<> IRBasanCheck(CheckTerm);
+    // If shadow memory check != 0, then we do regular ASan check
+    unsigned Granularity = 1 << Mapping.Scale;
+
+    if ((TypeSize == 8 || TypeSize == 16 || TypeSize == 32 || TypeSize == 64 || TypeSize == 128) && (Alignment >= Granularity || Alignment == 0 || Alignment >= TypeSize / 8)) {
+      instrumentAddress(CheckTerm, CheckTerm, addr, TypeSize, IsWrite, nullptr, false, 0);
+    } else {
+      instrumentUnusualSizeOrAlignment(CheckTerm, CheckTerm, addr, TypeSize, IsWrite, nullptr, false, 0);
+    }
+    deleted.insert((*optInst).second.first.second);
+
+    for (auto eachInst : (*optInst).second.second) {
+      // Add regular ASan checks
+      Value *eachAddr = isInterestingMemoryAccess(eachInst.second, &IsWrite, &TypeSize, &Alignment);
+      unsigned Granularity = 1 << Mapping.Scale;
+      if ((TypeSize == 8 || TypeSize == 16 || TypeSize == 32 || TypeSize == 64 || TypeSize == 128) && (Alignment >= Granularity || Alignment == 0 || Alignment >= TypeSize / 8)) {
+        instrumentAddress(CheckTerm, CheckTerm, eachAddr, TypeSize, IsWrite, nullptr, false, 0);
+      } else {
+        instrumentUnusualSizeOrAlignment(CheckTerm, CheckTerm, eachAddr, TypeSize, IsWrite, nullptr, false, 0);
+      }
+
+      deleted.insert(eachInst.second);
+    }
+
+    // Eliminate the removable instructions, and update the list
+    for (auto optInstChild = rankPotentialRemoveInsts.begin(); optInstChild != rankPotentialRemoveInsts.end();) {
+      if(std::find((*optInst).second.second.begin(), (*optInst).second.second.end(), (*optInstChild).second.first) != (*optInst).second.second.end()) {
+        optInstChild = rankPotentialRemoveInsts.erase(optInstChild);
+      }
+      else {
+        ++optInstChild;
+      }
+    }
+  }
+}
+
+void AddressSanitizer::loopOptimization(Function &F, SmallVector<Instruction *, 16> &ToInstrument) {
+  // Get loop analysis for current function
+  LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+  const TargetLibraryInfo *TLI =
+      &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI();
+
+  bool UseCalls =
+      CompileKernel ||
+      (ClInstrumentationWithCallsThreshold >= 0 &&
+       ToInstrument.size() > (unsigned)ClInstrumentationWithCallsThreshold);
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  ObjectSizeOffsetVisitor ObjSizeVis(DL, TLI, F.getContext(),
+                                     /*RoundToAlign=*/true);
+
+  std::set<Instruction *> optimized;
+  for (auto Inst : ToInstrument) {
+    LLVMContext& C = (*Inst).getContext();
+    // Check if current instruction is inside loop
+    if (Loop *L = LI.getLoopFor(Inst->getParent())) {
+      // Categorise the type of optimization
+      if (loopOptimizationCategorise(F, L, Inst, ToInstrument) == IBIO) {
+        // "Relocating Invariant Checks" Optimization
+        InvariantOptimizeHandler(L, optimized, F, ObjSizeVis, Inst, UseCalls);
+      } else {
+        // "Grouping  Monotonic  Checks" Optimization
+        MonotonicOptimizeHandler(L, optimized, F, ObjSizeVis, Inst, UseCalls);
+      }
+    }
+  }
+
+  SmallVector<Instruction *, 16> LOTempToInstrument(ToInstrument);
+  ToInstrument.clear();
+
+  for (auto item: LOTempToInstrument) {
+    if (optimized.find(item) == optimized.end())
+      ToInstrument.push_back(item);
+  }
+}
+
+enum addrType AddressSanitizer::loopOptimizationCategorise(Function &F, Loop *L, Instruction *Inst, SmallVector<Instruction *, 16> &ToInstrument) {
+  bool IsWrite;
+  unsigned Alignment;
+  uint64_t TypeSize;
+
+  std::vector<Value *> backs;
+  std::vector<Value *> processedAddr;
+  ScalarEvolution *SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+
+  if (Value* addr = isInterestingMemoryAccess(Inst, &IsWrite, &TypeSize, &Alignment)) {
+    btraceInLoop(addr, backs, L);
+    return checkAddrType(addr, backs, processedAddr, SE, L);
+  }
+  return UNKNOWN;
+}
+
+static void singleIndexCaseHandler(std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, GetElementPtrInst *Gep_Inst, Instruction *Inst) {
+  Value *baseAddr = Gep_Inst->getPointerOperand();
+  // In order to make form unified, we create a string place holder
+  std::string offsets_single;
+  std::pair<Value *, std::string> key;
+  std::pair<int64_t, Instruction *> value;
+
+  if (auto *offsetAddr = dyn_cast<ConstantInt>(Gep_Inst->idx_begin())) {
+    key.first = baseAddr;
+    key.second = offsets_single;
+    if (baseAddrOffsetMap_multi.find(key) == baseAddrOffsetMap_multi.end()) {
+      //never appeared in the map, so add a slot
+      baseAddrOffsetMap_multi.insert(std::pair<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *> >>(key, std::set<std::pair<int64_t, Instruction *>>()));
+    }
+    // Convert last offset into int
+    int64_t intLastOffset = offsetAddr->getSExtValue();
+    value.first = intLastOffset;
+    value.second = Inst;
+    baseAddrOffsetMap_multi[key].insert(value);
+  }
+}
+
+static void multiIndexCaseHandler(std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, GetElementPtrInst *Gep_Inst, Instruction *Inst) {
+  Value *baseAddr = Gep_Inst->getPointerOperand();
+  std::pair<Value *, std::string> key;
+  std::pair<int64_t, Instruction *> value;
+
+  // String to collect offsets from beg to end - 1
+  std::string offsets;
+  bool offsetConstantInt = true;
+  for (auto& index : make_range(Gep_Inst->idx_begin(), Gep_Inst->idx_end() - 1)) {
+    if (auto *offsetAddr_multi = dyn_cast<ConstantInt>(index)) {
+      int64_t intOffset = offsetAddr_multi->getSExtValue();
+      offsets.push_back(intOffset);
+    } else {
+      offsetConstantInt = false;
+      break;
+    }
+  }
+
+  if (!offsetConstantInt) {
+    return;
+  }
+
+  // Here we check the value of last offset
+  if (auto *offsetAddr_last = dyn_cast<ConstantInt>(Gep_Inst->idx_end() - 1)) {
+    key.first = baseAddr;
+    key.second = offsets;
+    if (baseAddrOffsetMap_multi.find(key) == baseAddrOffsetMap_multi.end()) {
+      //never appeared in the map, so add a slot
+      baseAddrOffsetMap_multi.insert(std::pair<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>>(key, std::set<std::pair<int64_t, Instruction *>>()));
+    }
+    // Convert last offset into int
+    int64_t intLastOffset = offsetAddr_last->getSExtValue();
+    value.first = intLastOffset;
+    value.second = Inst;
+    baseAddrOffsetMap_multi[key].insert(value);
+  }
+}
+
+static void preprocessPotentialRemoveInsts(Function &F, std::pair<const std::pair<llvm::Value *, std::__cxx11::string>, std::set<std::pair<int64_t, llvm::Instruction *>>> &baseAddrOffsetSet, std::map<Instruction *, std::set<std::pair<Instruction *, Instruction *>>> &potentialRemoveInsts) {
+  DominatorTree DT(F);
+  PostDominatorTree PDT;
+  PDT.recalculate(F);
+
+  // offsetInstA is node A
+  for (auto offsetInstA : baseAddrOffsetSet.second) {
+    // offsetInstB is node B
+    for (auto offsetInstB : baseAddrOffsetSet.second) {
+      if (offsetInstA == offsetInstB)
+        continue;
+      // offsetInstC is node C
+      for (auto offsetInstC : baseAddrOffsetSet.second) {
+        if (offsetInstA == offsetInstC || offsetInstB == offsetInstC)
+          continue;
+
+        // Here we ensure (A dominate B OR A post-dominate B) AND (OFFSET(C) > OFFSET(B) AND OFFSET(B) > OFFSET(A) AND OFFSET(C) - OFFSET(A) < 16)
+        if ( (DT.dominates(offsetInstA.second, offsetInstB.second) || PDT.dominates((offsetInstA.second)->getParent(), (offsetInstB.second)->getParent()))
+            && (offsetInstC.first > offsetInstB.first && offsetInstB.first > offsetInstA.first && offsetInstC.first - offsetInstA.first < RZ_SIZE) ) {
+          // If above conditions are satisfied, then ASan check on B can be removed.
+          if (potentialRemoveInsts.find(offsetInstB.second) == potentialRemoveInsts.end()) {
+            potentialRemoveInsts.insert(std::pair<Instruction *, std::set<std::pair<Instruction *, Instruction *>>>(offsetInstB.second, std::set<std::pair<Instruction *, Instruction *>>()));
+          }
+          // Store the ASan check removable instruction B, and the pair of instructions A and C that ensure the ASan Check to map
+          std::pair<Instruction *, Instruction *> InstsPair;
+          InstsPair.first = offsetInstA.second;
+          InstsPair.second = offsetInstC.second;
+          potentialRemoveInsts[offsetInstB.second].insert(InstsPair);
+        }
+      }
+    }
+  }
+}
+
+static void removeInstructionFunc(std::map<Instruction *, std::set<std::pair<Instruction *, Instruction *>>> &potentialRemoveInsts, std::set<Instruction *> &deleted) {
+  std::list<std::pair<int, Instruction *>> rankPotentialRemoveInsts;
+
+  for(auto instVectorMap = potentialRemoveInsts.begin(); instVectorMap != potentialRemoveInsts.end(); ++instVectorMap) {
+    int countInst = 0;
+    for(auto instVector = potentialRemoveInsts.begin(); instVector != potentialRemoveInsts.end(); ++instVector) {
+      if (instVector == instVectorMap)
+        continue;
+      for (auto instPair = (*instVector).second.begin(); instPair != (*instVector).second.end(); ++instPair) {
+        if ((*instVector).first == instPair->first || (*instVector).first == instPair->second) {
+          countInst++;
+        }
+      }
+    }
+    rankPotentialRemoveInsts.push_back(std::pair<int, Instruction *>(countInst, (*instVectorMap).first));
+  }
+
+  rankPotentialRemoveInsts.sort();
+
+  for(auto countInst : rankPotentialRemoveInsts) {
+    bool removeInst = true;
+    for (auto elem : deleted) {
+      removeInst = false;
+      for (auto instPair : potentialRemoveInsts[countInst.second]) {
+        if (instPair.first != elem && instPair.second != elem) {
+          removeInst = true;
+          break;
+        }
+      }
+      if (!removeInst)
+        break;
+    }
+    if (!removeInst)
+      continue;
+    deleted.insert(countInst.second);
+    // remove all pairs that contain current key instruction and update the map
+    for(auto instVectorMap = potentialRemoveInsts.begin(); instVectorMap != potentialRemoveInsts.end(); ++instVectorMap) {
+      for (auto instPair = (*instVectorMap).second.begin(); instPair != (*instVectorMap).second.end();) {
+        if (countInst.second == instPair->first || countInst.second == instPair->second) {
+          instPair = (*instVectorMap).second.erase(instPair);
+        }
+        else {
+          ++instPair;
+        }
+      }
+    }
+  }
+}
+
+static void preprocessInstructionsMap(Function &F, std::pair<const std::pair<llvm::Value *, std::__cxx11::string>, std::set<std::pair<int64_t, llvm::Instruction *>>> &baseAddrOffsetSet, std::map<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>> &instructionsMap) {
+  DominatorTree DT(F);
+  PostDominatorTree PDT;
+  PDT.recalculate(F);
+  // offsetInstA is node A
+  for (auto offsetInstA : baseAddrOffsetSet.second) {
+    // offsetInstB is node B
+    for (auto offsetInstB : baseAddrOffsetSet.second) {
+      if (offsetInstA == offsetInstB)
+        continue;
+
+      // Here we ensure (A dominate B OR B post-dominte A) AND distance between A and B is less than 64
+      if ( offsetInstA.first - offsetInstB.first < CHECK_RANGE && offsetInstB.first - offsetInstA.first < CHECK_RANGE
+          && (DT.dominates(offsetInstA.second, offsetInstB.second) || PDT.dominates(offsetInstB.second->getParent(), offsetInstA.second->getParent()))) {
+        // If all above conditions are satisfied, then we can remove the ASan check on B
+        if (instructionsMap.find(offsetInstA) == instructionsMap.end()) {
+          instructionsMap.insert(std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>(offsetInstA, std::vector<std::pair<int64_t, llvm::Instruction *>>()));
+        }
+        // Store the ASan check removable instruction B to map
+        instructionsMap[offsetInstA].push_back(offsetInstB);
+      }
+      else {
+        break;
+      }
+    }
+  }
+}
+
+static void prioritiseRemovableInst(std::map<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>> &instructionsMap, std::list<std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>>> &rankPotentialRemoveInsts) {
+  for (auto instVector : instructionsMap) {
+    rankPotentialRemoveInsts.push_back(std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>>(instVector.second.size(), instVector));
+  }
+
+  rankPotentialRemoveInsts.sort();
+  rankPotentialRemoveInsts.reverse();
+}
+
+static std::pair<int64_t, llvm::Instruction *> getLastInst(Function &F, std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>> optInst) {
+  DominatorTree DT(F);
+
+  std::pair<int64_t, llvm::Instruction *> lastInst = optInst.second.first;
+
+  for (auto eachInst : optInst.second.second) {
+    if (DT.dominates(eachInst.second, lastInst.second)) {
+      continue;
+    }
+    else {
+      lastInst = eachInst;
+    }
+  }
+
+  return lastInst;
+}
+
+static std::pair<int64_t, llvm::Instruction *> getMinDistance(std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>> optInst) {
+  std::pair<int64_t, llvm::Instruction *> minOffset = optInst.second.second.front();
+
+  for (auto eachInst : optInst.second.second) {
+    if (eachInst.first < minOffset.first) {
+      minOffset = eachInst;
+    }
+    else {
+      continue;
+    }
+  }
+
+  return minOffset;
+}
+
+static int getMaxDistance(std::pair<int, std::pair<std::pair<int64_t, llvm::Instruction *>, std::vector<std::pair<int64_t, llvm::Instruction *>>>> optInst) {
+  int maxOffset = 0;
+
+  for (auto eachInst : optInst.second.second) {
+    if (eachInst.first > maxOffset) {
+      maxOffset = eachInst.first;
+    }
+    else {
+      continue;
+    }
+  }
+
+  return maxOffset;
+}
+
+static void updateBaseAddrOffsetMap(std::map<std::pair<Value *, std::string>, std::set<std::pair<int64_t, Instruction *>>> &baseAddrOffsetMap_multi, std::set<Instruction *> &deleted) {
+  for (auto baseAddrOffsetSet = baseAddrOffsetMap_multi.begin(); baseAddrOffsetSet != baseAddrOffsetMap_multi.end(); ++baseAddrOffsetSet) {
+    for (auto offsetInst = (*baseAddrOffsetSet).second.begin(); offsetInst != (*baseAddrOffsetSet).second.end();) {
+      if (deleted.find((*offsetInst).second) != deleted.end()) {
+        offsetInst = (*baseAddrOffsetSet).second.erase(offsetInst);
+      }
+      else {
+        ++offsetInst;
+      }
+    }
+  }
 }
